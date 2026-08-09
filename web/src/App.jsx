@@ -3,6 +3,7 @@ import { loadEnsemble, isEnsemble } from './lib/ensemble'
 import LabPredict from './labs/LabPredict'
 import LabAblation from './labs/LabAblation'
 import LabOOD from './labs/LabOOD'
+import LabBias from './labs/LabBias'
 import ParityCheck from './dev/ParityCheck'
 
 const LABS = [
@@ -73,6 +74,8 @@ export default function App() {
         <LabAblation />
       ) : tab === 'ood' ? (
         <LabOOD />
+      ) : tab === 'bias' ? (
+        <LabBias />
       ) : (
         <p className="rounded-xl border border-dashed border-slate-800 p-8 text-center text-slate-500">
           Lab under construction.
