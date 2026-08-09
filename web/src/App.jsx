@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { loadEnsemble, isEnsemble } from './lib/ensemble'
 import LabPredict from './labs/LabPredict'
+import LabAblation from './labs/LabAblation'
+import LabOOD from './labs/LabOOD'
 import ParityCheck from './dev/ParityCheck'
 
 const LABS = [
@@ -9,7 +11,7 @@ const LABS = [
   { id: 'ablation', n: 2, title: 'Erase a stroke',
     blurb: 'Find out which pen strokes the network was actually using.' },
   { id: 'ood', n: 3, title: "When AI doesn't know",
-    blurb: 'Draw something it was never taught, and watch its confidence break.' },
+    blurb: "Draw something it was never taught. It answers anyway — often confidently." },
   { id: 'bias', n: 4, title: 'Does AI understand everyone?',
     blurb: 'The same model, measured across 44 countries.' },
 ]
@@ -67,6 +69,10 @@ export default function App() {
         <p className="text-slate-500">{String(status)}…</p>
       ) : tab === 'predict' ? (
         <LabPredict classes={classes} />
+      ) : tab === 'ablation' ? (
+        <LabAblation />
+      ) : tab === 'ood' ? (
+        <LabOOD />
       ) : (
         <p className="rounded-xl border border-dashed border-slate-800 p-8 text-center text-slate-500">
           Lab under construction.

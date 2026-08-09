@@ -114,18 +114,31 @@ export function strokesToTensor(strokes) {
   return canvasToTensor(strokesToCanvas(strokes))
 }
 
-/** Normalize raw pointer strokes (canvas px) into the 0..255 box the model expects.
- *  Quick, Draw! art is scaled to fill its bounding box, so live input must be too. */
-export function normalizeStrokes(raw, pad = 8) {
-  const pts = raw.flatMap(([xs, ys]) => xs.map((x, i) => [x, ys[i]]))
-  if (!pts.length) return []
+/** Bounding box of raw strokes, or null when there is no ink. */
+export function bboxOf(raw) {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
-  for (const [x, y] of pts) {
-    if (x < minX) minX = x
-    if (x > maxX) maxX = x
-    if (y < minY) minY = y
-    if (y > maxY) maxY = y
+  for (const [xs, ys] of raw) {
+    for (let i = 0; i < xs.length; i++) {
+      if (xs[i] < minX) minX = xs[i]
+      if (xs[i] > maxX) maxX = xs[i]
+      if (ys[i] < minY) minY = ys[i]
+      if (ys[i] > maxY) maxY = ys[i]
+    }
   }
+  return minX === Infinity ? null : { minX, minY, maxX, maxY }
+}
+
+/** Normalize raw pointer strokes (canvas px) into the 0..255 box the model expects.
+ *  Quick, Draw! art is scaled to fill its bounding box, so live input must be too.
+ *
+ *  `box` pins the framing to another drawing's extent. Stroke ablation needs this:
+ *  re-normalizing each leave-one-out variant would rescale the survivors, so the
+ *  measured probability drop would confound "this stroke mattered" with "the
+ *  drawing got resized". */
+export function normalizeStrokes(raw, pad = 8, box = null) {
+  const b = box ?? bboxOf(raw)
+  if (!b) return []
+  const { minX, minY, maxX, maxY } = b
   const span = Math.max(maxX - minX, maxY - minY, 1)
   const scale = (255 - 2 * pad) / span
   // centre the shorter axis so aspect ratio is preserved

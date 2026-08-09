@@ -1,33 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef } from 'react'
 import DrawCanvas from '../components/DrawCanvas'
 import { TopK, DoubtMeter } from '../components/Readouts'
-import { strokesToTensor } from '../lib/preprocess'
-import { predict } from '../lib/ensemble'
+import { useLivePredict } from '../lib/useLivePredict'
 
 export default function LabPredict({ classes }) {
   const canvas = useRef(null)
-  const [result, setResult] = useState(null)
-  const [ms, setMs] = useState(null)
-  const pending = useRef(false)
-  const queued = useRef(null)
-
-  // Inference is fast but not free; coalesce bursts of pointer events so the
-  // canvas never blocks on a backlog of stale predictions.
-  const run = useCallback(async strokes => {
-    if (!strokes.length) { setResult(null); return }
-    if (pending.current) { queued.current = strokes; return }
-    pending.current = true
-    const t0 = performance.now()
-    const r = await predict(strokesToTensor(strokes))
-    setMs(performance.now() - t0)
-    setResult(r)
-    pending.current = false
-    if (queued.current) {
-      const next = queued.current
-      queued.current = null
-      run(next)
-    }
-  }, [])
+  const { result, ms, run } = useLivePredict()
 
   useEffect(() => { canvas.current?.clear() }, [])
 
