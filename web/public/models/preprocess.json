@@ -1,0 +1,1 @@
+{"img": 64, "supersample": 256, "stroke_width": 8, "binarize_threshold": 32, "note": "web app must reproduce: draw at supersample with stroke_width, downsample to img, ink = value > binarize_threshold"}

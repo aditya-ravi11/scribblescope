@@ -290,6 +290,15 @@ def stage_data():
 # Model
 # ----------------------------------------------------------------------------
 
+def pick_device(torch):
+    """cuda > mps > cpu. Missing mps here cost a 7x slowdown once — keep it."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def build_model():
     import torch.nn as nn
 
@@ -318,7 +327,7 @@ def stage_train():
     import torch
     from torch.utils.data import DataLoader, TensorDataset
 
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    dev = pick_device(torch)
     print(f"device={dev}")
 
     def load(tag):
@@ -411,7 +420,7 @@ def stage_eval():
     ARTI.mkdir(parents=True, exist_ok=True)
     import torch
 
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    dev = pick_device(torch)
     te_x = np.load(DATA / "test_x.npy", mmap_mode="r")
     te_y = np.load(DATA / "test_y.npy")
     te_meta = json.loads((DATA / "test_meta.json").read_text())
