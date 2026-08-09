@@ -18,9 +18,11 @@ Design notes (also in the model card):
   * Splits are by key_id hash, fixed before any sampling — no drawing can leak
     across splits, and the test pool is NEVER subsampled, so the fairness audit
     covers every country with >=2k test rows (~45 countries).
-  * Baseline train set caps the US at 25%/class (natural share ~44%) so the
-    tail is represented; the "balanced" variant resamples with weights
-    proportional to n_country^-0.5 for the Fixing-Bias lab.
+  * The BASELINE train set is a uniform draw, so it inherits Quick, Draw!'s
+    natural country skew (US ~44%) — that is the model the fairness audit
+    indicts. The MITIGATED variant caps any one country at 25%/class, giving
+    the same 600k with far flatter geography. Both are trained identically;
+    the before/after gap is the Fixing-Bias result.
 """
 
 import hashlib
@@ -28,6 +30,7 @@ import json
 import math
 import os
 import random
+import time
 import urllib.parse
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
@@ -55,6 +58,7 @@ RUN_EXPORT = True
 # SMOKE mode: tiny end-to-end run (3 classes, ~20k lines/file, 1 epoch, CPU-ok)
 # to validate the full pipeline before spending GPU hours. Never for real metrics.
 SMOKE = os.environ.get("SCRIBBLE_SMOKE") == "1"
+FORCE_RETRAIN = os.environ.get("FORCE_RETRAIN") == "1"
 
 CLASSES = [
     "bread", "power outlet", "mailbox", "snowman", "chair", "house", "teapot",
@@ -78,7 +82,7 @@ STROKE_W = 8                # stroke width at SUPERSAMPLE scale
 BIN_THRESH = 32             # >thresh -> ink. Binary keeps train/serve parity exact
 TRAIN_PER_CLASS = 12_000
 CALIB_TOTAL = 60_000
-US_CAP_FRAC = 0.25          # baseline: max share of any single country per class
+COUNTRY_CAP_FRAC = 0.25     # mitigation: max share of any one country per class
 SEEDS = [1, 2, 3]
 BALANCED_SEED = 101         # trained on the balanced resample
 EPOCHS = 8
@@ -127,6 +131,23 @@ def rasterize(drawing, size=IMG, src=SUPERSAMPLE, width=STROKE_W, thresh=BIN_THR
     return (a > thresh).astype(np.uint8)
 
 
+def shift_pad(xb, sx, sy):
+    """Translate a batch by (sx, sy) px, filling with background.
+
+    torch.roll would wrap ink from one edge to the other — Quick, Draw! art is
+    scaled to touch the bounding box, so wrapped strokes are a real artifact.
+    """
+    import torch.nn.functional as F
+    sx, sy = int(sx), int(sy)
+    if sx == 0 and sy == 0:
+        return xb
+    xb = F.pad(xb, (abs(sx), abs(sx), abs(sy), abs(sy)))
+    h, w = xb.shape[-2:]
+    y0 = abs(sy) + sy
+    x0 = abs(sx) + sx
+    return xb[..., y0:y0 + h - 2 * abs(sy), x0:x0 + w - 2 * abs(sx)]
+
+
 def pack(imgs):
     """[N, 64, 64] binary -> [N, 512] bit-packed uint8 (8x smaller on disk)."""
     return np.packbits(imgs.reshape(len(imgs), -1), axis=1)
@@ -169,7 +190,7 @@ def stage_data():
     ARTI.mkdir(parents=True, exist_ok=True)
     rng = random.Random(SPLIT_SEED)
     calib_per_class = CALIB_TOTAL // len(CLASSES)
-    cap = int(TRAIN_PER_CLASS * US_CAP_FRAC)
+    cap = int(TRAIN_PER_CLASS * COUNTRY_CAP_FRAC)
 
     acc = {t: {"x": [], "y": [], "country": []} for t in ("train", "balanced", "calib", "test")}
     test_keys = []
@@ -201,36 +222,27 @@ def stage_data():
                         by_cc[cc].append(d["drawing"])
                         n_pool += 1
 
-            # --- baseline sample: TRAIN_PER_CLASS, no country above US_CAP_FRAC ---
+            for items in by_cc.values():
+                rng.shuffle(items)
+
+            # --- BASELINE: uniform random draw. Preserves Quick, Draw!'s natural
+            #     country skew (US ~44%). This is the model whose bias we audit. ---
+            flat = [(dr, cc) for cc, items in by_cc.items() for dr in items]
+            rng.shuffle(flat)
+            base = flat[:TRAIN_PER_CLASS]
+
+            # --- MITIGATED: cap any one country's contribution at COUNTRY_CAP_FRAC,
+            #     then top off from the overflow. Same size, flatter geography. ---
             capped, overflow = [], []
             for cc, items in by_cc.items():
-                rng.shuffle(items)
                 capped.extend((dr, cc) for dr in items[:cap])
                 overflow.extend((dr, cc) for dr in items[cap:])
             rng.shuffle(capped)
             if len(capped) >= TRAIN_PER_CLASS:
-                base = capped[:TRAIN_PER_CLASS]
+                bal = capped[:TRAIN_PER_CLASS]
             else:
                 rng.shuffle(overflow)
-                base = capped + overflow[: TRAIN_PER_CLASS - len(capped)]
-
-            # --- balanced sample: draw countries with p ~ n^0.5 (flattens the n^1 skew) ---
-            remaining = {cc: list(v) for cc, v in by_cc.items()}
-            ccs = list(remaining)
-            w = np.array([len(remaining[c]) ** 0.5 for c in ccs], dtype=np.float64)
-            w /= w.sum()
-            bal = []
-            grng = np.random.default_rng(SPLIT_SEED + ci)
-            for idx in grng.choice(len(ccs), size=min(TRAIN_PER_CLASS * 4, 200_000), p=w):
-                cc = ccs[idx]
-                if remaining[cc]:
-                    bal.append((remaining[cc].pop(), cc))
-                    if len(bal) == TRAIN_PER_CLASS:
-                        break
-            if len(bal) < TRAIN_PER_CLASS:      # top off from whatever is left
-                flat = [(dr, cc) for cc, v in remaining.items() for dr in v]
-                rng.shuffle(flat)
-                bal.extend(flat[: TRAIN_PER_CLASS - len(bal)])
+                bal = capped + overflow[: TRAIN_PER_CLASS - len(capped)]
 
             rng.shuffle(calib_pool)
             calib = calib_pool[:calib_per_class]
@@ -248,7 +260,7 @@ def stage_data():
             test_keys.extend(k for _, _, k in test_rows)
             showcase[cls] = [dr for dr, _, _ in test_rows[:12]]
 
-            del by_cc, remaining, calib_pool, test_rows, base, bal, capped, overflow
+            del by_cc, flat, calib_pool, test_rows, base, bal, capped, overflow
             print(f"[{ci + 1:02d}/{len(CLASSES)}] {cls:16s} pool={n_pool:>7,} "
                   f"test={len(acc['test']['y']) :>7,} (cum)", flush=True)
 
@@ -324,10 +336,17 @@ def stage_train():
         model = build_model().to(dev)
         nparams = sum(p.numel() for p in model.parameters())
         print(f"\n=== seed {seed} on '{tag}' ({n:,} rows, {nparams / 1e6:.2f}M params) ===")
+        ckpt = ARTI / f"cnn_seed{seed}.pt"
+        if ckpt.exists() and not FORCE_RETRAIN:
+            print(f"  (checkpoint exists, skipping — set FORCE_RETRAIN=1 to redo)")
+            model.load_state_dict(torch.load(ckpt, map_location=dev))
+            return model
+
         opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
         steps = math.ceil(n / BATCH) * EPOCHS
         sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=LR, total_steps=steps, pct_start=0.05)
-        scaler = torch.amp.GradScaler(dev)
+        amp_ok = dev == "cuda"          # measured: MPS autocast is slower than fp32
+        scaler = torch.amp.GradScaler(dev, enabled=amp_ok)
         lossf = torch.nn.CrossEntropyLoss(label_smoothing=0.05)
 
         idx = np.arange(n)
@@ -335,16 +354,15 @@ def stage_train():
             model.train()
             np.random.shuffle(idx)
             tot = correct = seen = 0
+            t_ep = time.time()
             for i in range(0, n, BATCH):
                 bidx = np.sort(idx[i:i + BATCH])  # sorted gather is faster on memmap
                 xb = torch.from_numpy(unpack(x[bidx])).to(dev, non_blocking=True)
                 xb = xb.float().unsqueeze(1)
-                # light augmentation: random +-3px shift
                 if ep < EPOCHS - 1:
-                    sx, sy = np.random.randint(-3, 4, 2)
-                    xb = torch.roll(xb, shifts=(int(sx), int(sy)), dims=(2, 3))
+                    xb = shift_pad(xb, *np.random.randint(-3, 4, 2))
                 yb = torch.from_numpy(y[bidx]).to(dev)
-                with torch.amp.autocast(dev):
+                with torch.amp.autocast(dev, enabled=amp_ok):
                     out = model(xb)
                     loss = lossf(out, yb)
                 opt.zero_grad(set_to_none=True)
@@ -355,11 +373,15 @@ def stage_train():
                 tot += loss.item() * len(yb)
                 correct += (out.argmax(1) == yb).sum().item()
                 seen += len(yb)
-            # quick calib-set accuracy as val proxy
             model.eval()
             cacc = evaluate_logits(model, ca_x, ca_y, dev)[1]
-            print(f"  ep{ep + 1}: train_loss={tot / seen:.4f} train_acc={correct / seen:.4f} calib_acc={cacc:.4f}")
-        torch.save(model.state_dict(), ARTI / f"cnn_seed{seed}.pt")
+            # checkpoint every epoch: a 10h unattended run must survive interruption
+            torch.save(model.state_dict(), ARTI / f"cnn_seed{seed}.ep{ep + 1}.pt")
+            print(f"  ep{ep + 1}: train_loss={tot / seen:.4f} train_acc={correct / seen:.4f} "
+                  f"calib_acc={cacc:.4f} ({(time.time() - t_ep) / 60:.1f} min)", flush=True)
+        torch.save(model.state_dict(), ckpt)
+        for stale in ARTI.glob(f"cnn_seed{seed}.ep*.pt"):
+            stale.unlink()
         return model
 
     for s in SEEDS:
