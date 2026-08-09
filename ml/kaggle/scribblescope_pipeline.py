@@ -85,8 +85,8 @@ CALIB_TOTAL = 60_000
 COUNTRY_CAP_FRAC = 0.25     # mitigation: max share of any one country per class
 SEEDS = [1, 2, 3]
 BALANCED_SEED = 101         # trained on the balanced resample
-EPOCHS = 8
-BATCH = 512
+EPOCHS = 6
+BATCH = 256
 LR = 3e-3
 SPLIT_SEED = 20260809
 
@@ -290,6 +290,19 @@ def stage_data():
 # Model
 # ----------------------------------------------------------------------------
 
+def free_cache(torch, dev):
+    """Release the caching allocator's free blocks.
+
+    On MPS this matters: the allocator grew unbounded across an epoch until the
+    process held ~7 GB, the machine went 4.7 GB into swap, and epoch time went
+    from 22 minutes to 89. Releasing costs a few ms per call.
+    """
+    if dev == "mps":
+        torch.mps.empty_cache()
+    elif dev == "cuda":
+        torch.cuda.empty_cache()
+
+
 def pick_device(torch):
     """cuda > mps > cpu. Missing mps here cost a 7x slowdown once — keep it."""
     if torch.cuda.is_available():
@@ -351,15 +364,26 @@ def stage_train():
             model.load_state_dict(torch.load(ckpt, map_location=dev))
             return model
 
+        # Resume from the newest per-epoch checkpoint. A warm restart re-runs the
+        # LR schedule over the remaining epochs, which is fine and beats losing hours.
+        done = sorted(ARTI.glob(f"cnn_seed{seed}.ep*.pt"),
+                      key=lambda p_: int(p_.stem.split(".ep")[1]))
+        start_ep = 0
+        if done:
+            start_ep = int(done[-1].stem.split(".ep")[1])
+            model.load_state_dict(torch.load(done[-1], map_location=dev))
+            print(f"  resuming from epoch {start_ep}")
+        n_epochs = max(EPOCHS - start_ep, 1)
+
         opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
-        steps = math.ceil(n / BATCH) * EPOCHS
+        steps = math.ceil(n / BATCH) * n_epochs
         sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=LR, total_steps=steps, pct_start=0.05)
         amp_ok = dev == "cuda"          # measured: MPS autocast is slower than fp32
         scaler = torch.amp.GradScaler(dev, enabled=amp_ok)
         lossf = torch.nn.CrossEntropyLoss(label_smoothing=0.05)
 
         idx = np.arange(n)
-        for ep in range(EPOCHS):
+        for ep in range(start_ep, EPOCHS):
             model.train()
             np.random.shuffle(idx)
             tot = correct = seen = 0
@@ -382,8 +406,11 @@ def stage_train():
                 tot += loss.item() * len(yb)
                 correct += (out.argmax(1) == yb).sum().item()
                 seen += len(yb)
+                if (i // BATCH) % 200 == 199:
+                    free_cache(torch, dev)
             model.eval()
             cacc = evaluate_logits(model, ca_x, ca_y, dev)[1]
+            free_cache(torch, dev)
             # checkpoint every epoch: a 10h unattended run must survive interruption
             torch.save(model.state_dict(), ARTI / f"cnn_seed{seed}.ep{ep + 1}.pt")
             print(f"  ep{ep + 1}: train_loss={tot / seen:.4f} train_acc={correct / seen:.4f} "
