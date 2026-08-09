@@ -73,6 +73,9 @@ WORK = Path("/kaggle/working") if Path("/kaggle/working").exists() else Path("wo
 DATA = WORK / "data"
 ARTI = WORK / "artifacts"   # checkpoints, onnx, eval json — download these
 IMG = 64
+SUPERSAMPLE = 256           # rasterize here, then box-down to IMG (web app matches)
+STROKE_W = 8                # stroke width at SUPERSAMPLE scale
+BIN_THRESH = 32             # >thresh -> ink. Binary keeps train/serve parity exact
 TRAIN_PER_CLASS = 12_000
 CALIB_TOTAL = 60_000
 US_CAP_FRAC = 0.25          # baseline: max share of any single country per class
@@ -103,37 +106,50 @@ def bucket(key_id: str) -> int:
     return int(hashlib.md5(key_id.encode()).hexdigest()[:8], 16) % 100
 
 
-def rasterize(drawing, size=IMG, src=256, width=8):
+def rasterize(drawing, size=IMG, src=SUPERSAMPLE, width=STROKE_W, thresh=BIN_THRESH):
+    """Simplified strokes (0..255 coords) -> binary {0,1} uint8 [size, size].
+
+    Supersample at `src`, box-downsample to `size`, threshold. The web app
+    reproduces this exact path on a canvas (offscreen 256 -> drawImage 64 ->
+    threshold), so training and serving see the same pixels.
+    """
     from PIL import Image, ImageDraw
     img = Image.new("L", (src, src), 0)
     d = ImageDraw.Draw(img)
     for stroke in drawing:
         pts = list(zip(stroke[0], stroke[1]))
         if len(pts) == 1:
-            d.ellipse([pts[0][0] - width // 2, pts[0][1] - width // 2,
-                       pts[0][0] + width // 2, pts[0][1] + width // 2], fill=255)
+            r = width // 2
+            d.ellipse([pts[0][0] - r, pts[0][1] - r, pts[0][0] + r, pts[0][1] + r], fill=255)
         else:
-            d.line(pts, fill=255, width=width)
-    return np.asarray(img.resize((size, size), Image.BILINEAR), dtype=np.uint8)
+            d.line(pts, fill=255, width=width, joint="curve")
+    a = np.asarray(img.resize((size, size), Image.BILINEAR), dtype=np.uint8)
+    return (a > thresh).astype(np.uint8)
 
 
-def _raster_chunk(args):
-    drawings, size = args
-    return np.stack([rasterize(dr, size) for dr in drawings])
+def pack(imgs):
+    """[N, 64, 64] binary -> [N, 512] bit-packed uint8 (8x smaller on disk)."""
+    return np.packbits(imgs.reshape(len(imgs), -1), axis=1)
 
 
-def rasterize_all(drawings, tag):
-    """Parallel rasterization -> uint8 array [N, IMG, IMG]."""
-    n = len(drawings)
+def unpack(packed):
+    """[N, 512] -> [N, 64, 64] uint8 in {0,1}."""
+    return np.unpackbits(packed, axis=1).reshape(-1, IMG, IMG)
+
+
+def _raster_chunk(drawings):
+    return pack(np.stack([rasterize(dr) for dr in drawings]))
+
+
+def rasterize_packed(drawings, pool=None):
+    """Parallel rasterize + bit-pack -> [N, 512] uint8."""
+    if not drawings:
+        return np.zeros((0, IMG * IMG // 8), dtype=np.uint8)
     chunk = 2000
-    chunks = [(drawings[i:i + chunk], IMG) for i in range(0, n, chunk)]
-    out = []
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as ex:
-        for i, arr in enumerate(ex.map(_raster_chunk, chunks)):
-            out.append(arr)
-            if i % 25 == 0:
-                print(f"    raster {tag}: {min((i + 1) * chunk, n):,}/{n:,}")
-    return np.concatenate(out)
+    chunks = [drawings[i:i + chunk] for i in range(0, len(drawings), chunk)]
+    if pool is None:
+        return np.concatenate([_raster_chunk(c) for c in chunks])
+    return np.concatenate(list(pool.map(_raster_chunk, chunks)))
 
 
 # ----------------------------------------------------------------------------
@@ -141,132 +157,121 @@ def rasterize_all(drawings, tag):
 # ----------------------------------------------------------------------------
 
 def stage_data():
+    """Stream + split + sample + rasterize, one class at a time.
+
+    Memory is bounded by ONE class's stroke pool (~130k drawings, a few hundred
+    MB): each class is rasterized and bit-packed immediately, then its stroke
+    vectors are dropped. Packed output for all four splits is ~1 GB total.
+    """
     import requests
 
     DATA.mkdir(parents=True, exist_ok=True)
     ARTI.mkdir(parents=True, exist_ok=True)
     rng = random.Random(SPLIT_SEED)
-
-    tr_img_rows, tr_label, tr_country = [], [], []
-    bal_rows_by_class = []                       # per-class candidate pools for balanced resample
-    te_img_rows, te_label, te_country, te_key = [], [], [], []
-    ca_img_rows, ca_label = [], []
-    showcase = defaultdict(list)                 # stroke vectors for the app's canned demos
-
     calib_per_class = CALIB_TOTAL // len(CLASSES)
+    cap = int(TRAIN_PER_CLASS * US_CAP_FRAC)
 
-    for ci, cls in enumerate(CLASSES):
-        url = BASE.format(urllib.parse.quote(cls))
-        train_pool, calib_pool, test_rows = [], [], []
-        with requests.get(url, stream=True, timeout=120) as r:
-            r.raise_for_status()
-            for ln_no, line in enumerate(r.iter_lines()):
-                if MAX_LINES_PER_FILE and ln_no >= MAX_LINES_PER_FILE:
-                    break
-                if not line:
-                    continue
-                d = jloads(line)
-                if not d.get("recognized"):
-                    continue
-                b = bucket(d["key_id"])
-                cc = d.get("countrycode") or "??"
-                if b >= 90:
-                    test_rows.append((d["drawing"], cc, d["key_id"]))
-                elif b >= 85:
-                    calib_pool.append(d["drawing"])
-                else:
-                    train_pool.append((d["drawing"], cc))
+    acc = {t: {"x": [], "y": [], "country": []} for t in ("train", "balanced", "calib", "test")}
+    test_keys = []
+    showcase = {}
 
-        # --- baseline train sample: 12k/class, any single country capped at 25% ---
-        by_cc = defaultdict(list)
-        for dr, cc in train_pool:
-            by_cc[cc].append(dr)
-        cap = int(TRAIN_PER_CLASS * US_CAP_FRAC)
-        chosen = []
-        overflow = []
-        for cc, items in by_cc.items():
-            rng.shuffle(items)
-            take = items[:cap]
-            chosen.extend((dr, cc) for dr in take)
-            overflow.extend((dr, cc) for dr in items[cap:])
-        if len(chosen) > TRAIN_PER_CLASS:
-            rng.shuffle(chosen)
-            chosen = chosen[:TRAIN_PER_CLASS]
-        else:
-            rng.shuffle(overflow)
-            chosen.extend(overflow[: TRAIN_PER_CLASS - len(chosen)])
-        for dr, cc in chosen:
-            tr_img_rows.append(dr)
-            tr_label.append(ci)
-            tr_country.append(cc)
+    with ProcessPoolExecutor(max_workers=max(os.cpu_count() - 1, 1)) as pool:
+        for ci, cls in enumerate(CLASSES):
+            url = BASE.format(urllib.parse.quote(cls))
+            by_cc = defaultdict(list)     # train-bucket drawings, keyed by country
+            calib_pool, test_rows = [], []
+            n_pool = 0
+            with requests.get(url, stream=True, timeout=180) as r:
+                r.raise_for_status()
+                for ln_no, line in enumerate(r.iter_lines()):
+                    if MAX_LINES_PER_FILE and ln_no >= MAX_LINES_PER_FILE:
+                        break
+                    if not line:
+                        continue
+                    d = jloads(line)
+                    if not d.get("recognized"):
+                        continue
+                    b = bucket(d["key_id"])
+                    cc = d.get("countrycode") or "??"
+                    if b >= 90:
+                        test_rows.append((d["drawing"], cc, d["key_id"]))
+                    elif b >= 85:
+                        calib_pool.append(d["drawing"])
+                    else:
+                        by_cc[cc].append(d["drawing"])
+                        n_pool += 1
 
-        # --- balanced-resample candidates: keep the per-country pools (counts only + rows) ---
-        bal_rows_by_class.append({cc: items for cc, items in by_cc.items()})
+            # --- baseline sample: TRAIN_PER_CLASS, no country above US_CAP_FRAC ---
+            capped, overflow = [], []
+            for cc, items in by_cc.items():
+                rng.shuffle(items)
+                capped.extend((dr, cc) for dr in items[:cap])
+                overflow.extend((dr, cc) for dr in items[cap:])
+            rng.shuffle(capped)
+            if len(capped) >= TRAIN_PER_CLASS:
+                base = capped[:TRAIN_PER_CLASS]
+            else:
+                rng.shuffle(overflow)
+                base = capped + overflow[: TRAIN_PER_CLASS - len(capped)]
 
-        # --- calib: fixed n per class ---
-        rng.shuffle(calib_pool)
-        for dr in calib_pool[:calib_per_class]:
-            ca_img_rows.append(dr)
-            ca_label.append(ci)
+            # --- balanced sample: draw countries with p ~ n^0.5 (flattens the n^1 skew) ---
+            remaining = {cc: list(v) for cc, v in by_cc.items()}
+            ccs = list(remaining)
+            w = np.array([len(remaining[c]) ** 0.5 for c in ccs], dtype=np.float64)
+            w /= w.sum()
+            bal = []
+            grng = np.random.default_rng(SPLIT_SEED + ci)
+            for idx in grng.choice(len(ccs), size=min(TRAIN_PER_CLASS * 4, 200_000), p=w):
+                cc = ccs[idx]
+                if remaining[cc]:
+                    bal.append((remaining[cc].pop(), cc))
+                    if len(bal) == TRAIN_PER_CLASS:
+                        break
+            if len(bal) < TRAIN_PER_CLASS:      # top off from whatever is left
+                flat = [(dr, cc) for cc, v in remaining.items() for dr in v]
+                rng.shuffle(flat)
+                bal.extend(flat[: TRAIN_PER_CLASS - len(bal)])
 
-        # --- test: EVERYTHING in the test bucket ---
-        for dr, cc, k in test_rows:
-            te_img_rows.append(dr)
-            te_label.append(ci)
-            te_country.append(cc)
-            te_key.append(k)
-        showcase[cls] = [dr for dr, cc, _ in test_rows[:20]]
+            rng.shuffle(calib_pool)
+            calib = calib_pool[:calib_per_class]
 
-        print(f"[{ci + 1:02d}/50] {cls:16s} train_pool={len(train_pool):>7,} test={len(test_rows):>6,}")
+            # --- rasterize + pack now, then drop this class's stroke vectors ---
+            for tag, rows in (("train", base), ("balanced", bal)):
+                acc[tag]["x"].append(rasterize_packed([dr for dr, _ in rows], pool))
+                acc[tag]["y"].extend([ci] * len(rows))
+                acc[tag]["country"].extend(cc for _, cc in rows)
+            acc["calib"]["x"].append(rasterize_packed(calib, pool))
+            acc["calib"]["y"].extend([ci] * len(calib))
+            acc["test"]["x"].append(rasterize_packed([dr for dr, _, _ in test_rows], pool))
+            acc["test"]["y"].extend([ci] * len(test_rows))
+            acc["test"]["country"].extend(cc for _, cc, _ in test_rows)
+            test_keys.extend(k for _, _, k in test_rows)
+            showcase[cls] = [dr for dr, _, _ in test_rows[:12]]
 
-    # --- balanced train set: 12k/class, weights ~ n_cc^-0.5 ---
-    bl_img_rows, bl_label, bl_country = [], [], []
-    for ci, pools in enumerate(bal_rows_by_class):
-        # weighted country draws without replacement; per-drawing weight n^-0.5
-        # => expected per-country count ~ n^0.5 (flattens the natural n^1 skew)
-        remaining = {cc: list(v) for cc, v in pools.items()}
-        ccs = list(remaining)
-        weights = np.array([len(remaining[cc]) ** 0.5 for cc in ccs])  # p ~ n^0.5 => count ~ n^0.5 (flattens n^1)
-        weights = weights / weights.sum()
-        counts = {cc: 0 for cc in ccs}
-        target = TRAIN_PER_CLASS
-        draws = np.random.default_rng(SPLIT_SEED + ci).choice(len(ccs), size=target * 2, p=weights)
-        for idx in draws:
-            cc = ccs[idx]
-            if remaining[cc]:
-                bl_img_rows.append(remaining[cc].pop())
-                bl_label.append(ci)
-                bl_country.append(cc)
-                counts[cc] += 1
-                target -= 1
-                if target == 0:
-                    break
-        if target > 0:  # top off from the largest pools
-            flat = [(cc, dr) for cc, v in remaining.items() for dr in v]
-            rng.shuffle(flat)
-            for cc, dr in flat[:target]:
-                bl_img_rows.append(dr)
-                bl_label.append(ci)
-                bl_country.append(cc)
+            del by_cc, remaining, calib_pool, test_rows, base, bal, capped, overflow
+            print(f"[{ci + 1:02d}/{len(CLASSES)}] {cls:16s} pool={n_pool:>7,} "
+                  f"test={len(acc['test']['y']) :>7,} (cum)", flush=True)
 
-    print(f"\nTotals: train={len(tr_img_rows):,} balanced={len(bl_img_rows):,} "
-          f"calib={len(ca_img_rows):,} test={len(te_img_rows):,}")
-
-    for tag, rows, labels, extra in [
-        ("train", tr_img_rows, tr_label, {"country": tr_country}),
-        ("balanced", bl_img_rows, bl_label, {"country": bl_country}),
-        ("calib", ca_img_rows, ca_label, {}),
-        ("test", te_img_rows, te_label, {"country": te_country, "key_id": te_key}),
-    ]:
-        imgs = rasterize_all(rows, tag)
-        np.save(DATA / f"{tag}_x.npy", imgs)
-        np.save(DATA / f"{tag}_y.npy", np.asarray(labels, dtype=np.int64))
-        meta = {"n": len(labels), **{k: v for k, v in extra.items()}}
+    for tag, d in acc.items():
+        x = np.concatenate(d["x"]) if d["x"] else np.zeros((0, IMG * IMG // 8), np.uint8)
+        np.save(DATA / f"{tag}_x.npy", x)
+        np.save(DATA / f"{tag}_y.npy", np.asarray(d["y"], dtype=np.int64))
+        meta = {"n": len(d["y"]), "packed": True, "img": IMG}
+        if d["country"]:
+            meta["country"] = d["country"]
+        if tag == "test":
+            meta["key_id"] = test_keys
         (DATA / f"{tag}_meta.json").write_text(json.dumps(meta))
-        print(f"  saved {tag}: {imgs.shape}")
+        print(f"  saved {tag}: packed{x.shape} = {x.nbytes / 1e6:.0f} MB, n={len(d['y']):,}")
 
     (ARTI / "showcase_strokes.json").write_text(json.dumps(showcase))
     (ARTI / "classes.json").write_text(json.dumps(CLASSES))
+    (ARTI / "preprocess.json").write_text(json.dumps({
+        "img": IMG, "supersample": SUPERSAMPLE, "stroke_width": STROKE_W,
+        "binarize_threshold": BIN_THRESH,
+        "note": "web app must reproduce: draw at supersample with stroke_width, "
+                "downsample to img, ink = value > binarize_threshold",
+    }))
 
 
 # ----------------------------------------------------------------------------
@@ -332,8 +337,8 @@ def stage_train():
             tot = correct = seen = 0
             for i in range(0, n, BATCH):
                 bidx = np.sort(idx[i:i + BATCH])  # sorted gather is faster on memmap
-                xb = torch.from_numpy(np.ascontiguousarray(x[bidx])).to(dev, non_blocking=True)
-                xb = xb.float().div_(255.0).unsqueeze(1)
+                xb = torch.from_numpy(unpack(x[bidx])).to(dev, non_blocking=True)
+                xb = xb.float().unsqueeze(1)
                 # light augmentation: random +-3px shift
                 if ep < EPOCHS - 1:
                     sx, sy = np.random.randint(-3, 4, 2)
@@ -367,7 +372,7 @@ def evaluate_logits(model, x, y, dev, return_logits=False):
     logits = []
     with torch.no_grad():
         for i in range(0, len(y), 2048):
-            xb = torch.from_numpy(np.array(x[i:i + 2048])).to(dev).float().div_(255.0).unsqueeze(1)
+            xb = torch.from_numpy(unpack(x[i:i + 2048])).to(dev).float().unsqueeze(1)
             logits.append(model(xb).float().cpu())
     logits = torch.cat(logits)
     acc = (logits.argmax(1).numpy() == y).mean()
@@ -563,7 +568,7 @@ def stage_export():
         # parity check on 256 random test images
         import onnxruntime as ort
         te_x = np.load(DATA / "test_x.npy", mmap_mode="r")
-        xb = np.ascontiguousarray(te_x[:256]).astype(np.float32)[:, None] / 255.0
+        xb = unpack(te_x[:256]).astype(np.float32)[:, None]
         with torch.no_grad():
             ref = torch.softmax(m(torch.from_numpy(xb)), 1).numpy()
         sess = ort.InferenceSession(str(qp), providers=["CPUExecutionProvider"])
