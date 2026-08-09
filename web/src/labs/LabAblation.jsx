@@ -2,6 +2,8 @@ import { useCallback, useRef, useState } from 'react'
 import DrawCanvas from '../components/DrawCanvas'
 import { bboxOf, normalizeStrokes, strokesToTensor } from '../lib/preprocess'
 import { predict } from '../lib/ensemble'
+import AdaPanel from '../components/AdaPanel'
+import { explainAblation } from '../lib/adaFallback'
 
 const HEAT = c => {
   // c in 0..1 -> slate (irrelevant) through amber to rose (load-bearing)
@@ -53,7 +55,7 @@ export default function LabAblation() {
   const maxDrop = contribs ? Math.max(...contribs.map(r => Math.abs(r.drop)), 1e-6) : 1
 
   return (
-    <div className="grid gap-8 lg:grid-cols-[420px_1fr]">
+    <div className="grid gap-8 lg:grid-cols-[420px_1fr_320px]">
       <div className="space-y-3">
         <DrawCanvas ref={canvas} onChange={onChange} />
         <button
@@ -127,6 +129,20 @@ export default function LabAblation() {
             </details>
           </>
         )}
+      </div>
+
+      <div className="h-[520px]">
+        <AdaPanel
+          summary={base && contribs ? explainAblation(base, contribs) : null}
+          context={base && contribs && {
+            lab: 'stroke ablation',
+            whole: { label: base.label, p: +base.p.toFixed(4) },
+            strokes: contribs.map(c => ({
+              stroke: c.i + 1, probabilityDrop: +c.drop.toFixed(4),
+              flipsTo: c.flipped ? c.becomes : null,
+            })),
+          }}
+        />
       </div>
     </div>
   )
